@@ -1,0 +1,493 @@
+import tkinter as tk
+from tkinter import messagebox, ttk
+import openai
+import threading
+import queue
+from google.maps import places_v1  # For Places API (New)
+import googlemaps  # For Geocoding (Legacy)
+from google.type import latlng_pb2  # For creating coordinate objects
+
+MY_GOOGLE_MAPS_KEY = "AIzaSyCzg28AeRyPbEyfMLbByt6aGRmcW1Jhm4A"
+MY_OPENROUTER_KEY = "YOUR_OPENROUTER_KEY_HERE"
+
+
+class FuelTrack(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        # --- API Clients Setup ---
+        self.api_queue = queue.Queue()
+        self.google_client = None  # Places (New) client
+        self.gmaps_client = None  # Geocoding (Legacy) client
+        self.openai_client = None
+        self.ai_enabled = False
+        self.google_api_enabled = False
+
+        self.setup_api_clients()
+
+        # --- Window and Variable Setup ---
+        self.title('FuelTrack - Live Price Comparison')
+        self.geometry('400x500')
+        self.resizable(False, False)
+
+        self.radio_var = tk.StringVar(value="Gasoline")
+        self.station_var = tk.StringVar()
+        self.current_station_prices = {}
+
+        # --- Create UI ---
+        self.create_widgets()
+        self.setup_town_list()
+
+    def setup_api_clients(self):
+        """Configure AI and Google Maps API clients from hardcoded keys"""
+
+        # 1. Configure AI (OpenRouter)
+        try:
+            self.openai_client = openai.OpenAI(
+                api_key=MY_OPENROUTER_KEY,
+                base_url="https://openrouter.ai/api/v1"
+            )
+            self.ai_enabled = True
+        except Exception as e:
+            self.ai_enabled = False
+            print(f"AI configuration failed: {e}")
+
+            # 2. Configure Google Maps API
+        try:
+            google_api_key = MY_GOOGLE_MAPS_KEY
+            if not google_api_key or google_api_key == "YOUR_GOOGLE_MAPS_KEY_HERE":
+                raise ValueError("Google API key is not set in the script")
+
+                # Initialize BOTH clients
+            self.google_client = places_v1.PlacesClient(
+                client_options={"api_key": google_api_key}
+            )
+            self.gmaps_client = googlemaps.Client(key=google_api_key)
+
+            self.google_api_enabled = True
+
+        except Exception as e:
+            self.google_api_enabled = False
+            print(f"Google Maps API configuration failed: {e}")
+            messagebox.showerror(
+                "Google API Error",
+                f"Failed to initialize Google Maps client: {e}\n\n"
+                "Please set the 'MY_GOOGLE_MAPS_KEY' variable in the script."
+            )
+
+    def setup_town_list(self):
+        """Initialize town list data structure"""
+        self.towns = [
+            "New Britain",
+            "Newington",
+            "West Hartford",
+            "Hartford"
+        ]
+        for town in self.towns:
+            self.town_listbox.insert(tk.END, town)
+        if not self.google_api_enabled:
+            self.calc_button.config(state='disabled')
+
+    def create_widgets(self):
+        """Create all UI components"""
+        title_label = tk.Label(
+            self,
+            text='FuelTrack - Smart Fuel Comparison',
+            font=('Helvetica', 14, 'bold'),
+            fg='dark blue'
+        )
+        title_label.grid(column=0, row=0, columnspan=3, pady=15, padx=10)
+        self.create_fuel_type_section()
+        self.create_mpg_section()
+        self.create_town_selection_section()
+        self.create_gas_station_section()
+        self.create_action_buttons()
+
+    def create_fuel_type_section(self):
+        """Create fuel type selection radio buttons"""
+        fuel_frame = ttk.LabelFrame(self, text="Fuel Type", padding=10)
+        fuel_frame.grid(column=0, row=1, columnspan=3, padx=10, pady=5, sticky='we')
+        self.rb_gasoline = ttk.Radiobutton(
+            fuel_frame,
+            text='Gasoline',
+            variable=self.radio_var,
+            value="Gasoline",
+            command=self.clear_station_cache
+        )
+        self.rb_gasoline.grid(column=0, row=0, padx=20)
+        self.rb_diesel = ttk.Radiobutton(
+            fuel_frame,
+            text='Diesel',
+            variable=self.radio_var,
+            value="Diesel",
+            command=self.clear_station_cache
+        )
+        self.rb_diesel.grid(column=1, row=0, padx=20)
+
+    def create_mpg_section(self):
+        """Create MPG input section"""
+        mpg_frame = ttk.LabelFrame(self, text="Vehicle Efficiency", padding=10)
+        mpg_frame.grid(column=0, row=2, columnspan=3, padx=10, pady=5, sticky='we')
+        mpg_label = ttk.Label(mpg_frame, text='Vehicle MPG:')
+        mpg_label.grid(column=0, row=0, padx=5)
+        self.mpg_entry = ttk.Entry(mpg_frame, width=15)
+        self.mpg_entry.grid(column=1, row=0, padx=5)
+        info_label = ttk.Label(
+            mpg_frame,
+            text='(Miles Per Gallon)',
+            font=('Helvetica', 8),
+            foreground='gray'
+        )
+        info_label.grid(column=2, row=0, padx=5)
+
+    def create_town_selection_section(self):
+        """Create town selection listbox"""
+        town_frame = ttk.LabelFrame(self, text="Select Town", padding=10)
+        town_frame.grid(column=0, row=3, columnspan=3, padx=10, pady=5, sticky='we')
+        listbox_container = tk.Frame(town_frame)
+        listbox_container.grid(column=0, row=0, columnspan=2)
+        self.town_listbox = tk.Listbox(
+            listbox_container,
+            height=5,
+            width=25,
+            exportselection=False,
+            selectbackground='light blue'
+        )
+        self.town_listbox.pack(side='left', fill='both', expand=True)
+        listbox_scrollbar = ttk.Scrollbar(
+            listbox_container,
+            orient='vertical',
+            command=self.town_listbox.yview
+        )
+        listbox_scrollbar.pack(side='right', fill='y')
+        self.town_listbox.config(yscrollcommand=listbox_scrollbar.set)
+        self.town_listbox.bind('<<ListboxSelect>>', self.start_api_search)
+
+    def create_gas_station_section(self):
+        """Create gas station selection combobox"""
+        station_frame = ttk.LabelFrame(self, text="Select Gas Station", padding=10)
+        station_frame.grid(column=0, row=4, columnspan=3, padx=10, pady=5, sticky='we')
+        station_label = ttk.Label(station_frame, text='Available Stations:')
+        station_label.grid(column=0, row=0, padx=5)
+        self.gas_station_combobox = ttk.Combobox(
+            station_frame,
+            textvariable=self.station_var,
+            state="disabled",
+            width=22
+        )
+        self.gas_station_combobox.grid(column=1, row=0, padx=5)
+
+    def create_action_buttons(self):
+        """Create action buttons"""
+        button_frame = ttk.Frame(self)
+        button_frame.grid(column=0, row=5, columnspan=3, pady=20)
+        self.calc_button = ttk.Button(
+            button_frame,
+            text="Calculate Cost",
+            command=self.show_price,
+            width=15
+        )
+        self.calc_button.grid(column=0, row=0, padx=10)
+        self.ai_button = ttk.Button(
+            button_frame,
+            text="Get Fuel Tips",
+            command=self.get_ai_recommendations,
+            width=15
+        )
+        self.ai_button.grid(column=1, row=0, padx=10)
+        if not self.ai_enabled:
+            self.ai_button.config(state='disabled')
+
+    def clear_station_cache(self):
+        """Clears station data when fuel type changes."""
+        self.current_station_prices = {}
+        self.station_var.set("")
+        self.gas_station_combobox.config(values=[], state="disabled")
+        if self.town_listbox.curselection():
+            self.start_api_search()
+
+    def start_api_search(self, event=None):
+        """Disables UI and starts the API search in a new thread."""
+        if not self.google_api_enabled:
+            messagebox.showerror("API Error", "Google Maps API client is not initialized.")
+            return
+        try:
+            selected_town = self.town_listbox.get(self.town_listbox.curselection()[0])
+        except IndexError:
+            return
+        fuel_type = self.radio_var.get()
+        self.station_var.set("Searching...")
+        self.gas_station_combobox.config(state="disabled")
+        self.calc_button.config(state="disabled")
+        self.update_idletasks()
+
+        # Start the background thread
+        threading.Thread(
+            target=self.run_api_search,
+            args=(selected_town, fuel_type),
+            daemon=True
+        ).start()
+
+        self.after(100, self.check_api_queue)
+
+    def run_api_search(self, town, fuel_type):
+        """
+        Runs on a background thread. Fetches data from Google Places API
+        and puts the result into the queue using a 2-step process.
+        """
+        try:
+            # --- STEP 1: Geocode the town name to get coordinates ---
+            geocode_result = self.gmaps_client.geocode(town)
+            if not geocode_result:
+                raise ValueError(f"Could not find coordinates for '{town}'")
+
+            location = geocode_result[0]['geometry']['location']
+            lat = location['lat']
+            lng = location['lng']
+
+            # --- STEP 2: Use coordinates to call search_nearby ---
+
+            google_fuel_type = "REGULAR_UNLEADED"
+            if fuel_type == "Diesel":
+                google_fuel_type = "DIESEL"
+
+                # 1. Define the center point
+            center_point = latlng_pb2.LatLng(latitude=lat, longitude=lng)
+
+            # 2. Define the circle for the search
+            search_circle = places_v1.types.geometry.Circle(
+                center=center_point,
+                radius=5000.0  # 5km radius
+            )
+
+            # 3. Create the LocationRestriction
+            location_restriction = places_v1.SearchNearbyRequest.LocationRestriction(
+                circle=search_circle
+            )
+
+            # 4. Build the *Search* request
+            search_request = places_v1.SearchNearbyRequest(
+                location_restriction=location_restriction,
+                included_types=["gas_station"],
+                rank_preference="DISTANCE",
+            )
+
+            # 5. Create metadata for the search call
+            search_field_mask = "places.name"
+            search_metadata = (('x-goog-fieldmask', search_field_mask),)
+
+            # 6. Call search_nearby, passing metadata
+            response = self.google_client.search_nearby(
+                request=search_request,
+                metadata=search_metadata
+            )
+
+            # --- STEP 3: Get Details for Each Place ---
+
+            # 1. Create metadata for the details call
+            details_field_mask = "displayName,fuelOptions"
+            details_metadata = (('x-goog-fieldmask', details_field_mask),)
+
+            stations_data = {}
+            count = 0
+
+            for place in response.places:
+                if count >= 5:  # Limit to 5 results
+                    break
+
+                if not place.name:
+                    continue
+
+                    # 2. Create the details request with ONLY the name
+                details_request = places_v1.GetPlaceRequest(
+                    name=place.name
+                )
+
+                # 3. Pass the *details* metadata
+                place_details = self.google_client.get_place(
+                    request=details_request,
+                    metadata=details_metadata
+                )
+
+                if place_details.fuel_options:
+                    for fuel_price in place_details.fuel_options.fuel_prices:
+                        if fuel_price.type_.name == google_fuel_type:
+                            price = fuel_price.price.units + (fuel_price.price.nanos / 1_000_000_000)
+
+                            # <-- MODIFIED: Use .text to get the plain string
+                            stations_data[place_details.display_name.text] = round(price, 2)
+
+                            count += 1
+                            break
+
+            self.api_queue.put(stations_data)
+
+        except Exception as e:
+            # Pass the error back to the main thread
+            self.api_queue.put({"error": str(e)})
+
+    def check_api_queue(self):
+        """
+        Checks the queue for data from the background thread.
+        If data is found, update the GUI. If not, check again later.
+        """
+        try:
+            result = self.api_queue.get(block=False)
+            self.calc_button.config(state="normal")
+
+            if isinstance(result, dict) and "error" in result:
+                messagebox.showerror("API Error", f"Could not fetch data: {result['error']}")
+                self.station_var.set("API search failed")
+                return
+
+            if not result:
+                messagebox.showinfo(
+                    "No Results",
+                    f"No stations found with {self.radio_var.get()} prices in this area."
+                )
+                self.station_var.set("No prices found")
+                self.gas_station_combobox.config(values=[], state="disabled")
+                return
+
+            self.current_station_prices = result
+            station_names = list(self.current_station_prices.keys())
+            self.gas_station_combobox.config(values=station_names, state='readonly')
+            if station_names:
+                self.station_var.set(station_names[0])
+            else:
+                self.station_var.set("No prices found")
+                self.gas_station_combobox.config(state="disabled")
+        except queue.Empty:
+            self.after(100, self.check_api_queue)
+
+    def show_price(self):
+        """Calculate and display fuel cost information"""
+        try:
+            selected_indices = self.town_listbox.curselection()
+            if not selected_indices:
+                raise IndexError("No town selected")
+            town = self.town_listbox.get(selected_indices[0])
+            station = self.station_var.get()
+            if not station or station in ["Searching...", "No prices found", "API search failed"]:
+                raise KeyError("No gas station selected")
+            mpg_text = self.mpg_entry.get().strip()
+            if not mpg_text:
+                raise ValueError("MPG value is required")
+            mpg = float(mpg_text)
+            if mpg <= 0:
+                raise ValueError("MPG must be greater than 0")
+            fuel_type = self.radio_var.get()
+            price = self.current_station_prices[station]
+            cost_per_mile = price / mpg
+            cost_per_100_miles = cost_per_mile * 100
+            result_string = self.generate_result_string(
+                station, town, fuel_type, price, mpg, cost_per_mile, cost_per_100_miles
+            )
+            messagebox.showinfo("Fuel Cost Calculation", result_string)
+        except IndexError:
+            messagebox.showerror("Input Error", "Please select a town from the list.")
+        except KeyError:
+            messagebox.showerror("Input Error", "Please select a valid gas station (or search first).")
+        except ValueError as e:
+            if "MPG" in str(e):
+                messagebox.showerror("Input Error", "Please enter a valid MPG number greater than 0.")
+            else:
+                messagebox.showerror("Input Error", str(e))
+
+    def generate_result_string(self, station, town, fuel_type, price, mpg, cost_per_mile, cost_per_100_miles):
+        """Generate formatted result string"""
+        return f""" 
+Fuel Cost Analysis 
+{'-' * 40} 
+
+Station: {station} ({town}) 
+Fuel Type: {fuel_type} 
+Vehicle MPG: {mpg} 
+
+Price: ${price:.2f} per gallon 
+Cost per Mile: ${cost_per_mile:.3f} 
+Cost per 100 Miles: ${cost_per_100_miles:.2f} 
+
+Savings Tip: 
+Consider stations within 5 cents for 
+better value when considering travel 
+distance to station. 
+"""
+
+    def get_ai_recommendations(self):
+        """Get AI-powered fuel saving recommendations"""
+        if not self.ai_enabled:
+            messagebox.showwarning(
+                "AI Service Unavailable",
+                "AI recommendations are not available. Please check your API configuration."
+            )
+            return
+        try:
+            fuel_type = self.radio_var.get()
+            mpg_text = self.mpg_entry.get().strip()
+            if not mpg_text:
+                messagebox.showwarning(
+                    "Input Required",
+                    "Please enter your vehicle's MPG to get personalized fuel tips."
+                )
+                return
+            prompt = self.create_ai_prompt(fuel_type, mpg_text)
+            self.ai_button.config(state='disabled', text="Loading...")
+            self.update()
+            response = self.openai_client.chat.completions.create(
+                model="openai/gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a fuel efficiency expert providing practical, actionable driving advice. Keep responses concise and focused on practical tips."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                max_tokens=350,
+                temperature=0.7
+            )
+            ai_tips = response.choices[0].message.content
+            messagebox.showinfo(
+                "AI Fuel Efficiency Tips",
+                f"Personalized Fuel-Saving Tips:\n\n{ai_tips}"
+            )
+        except Exception as e:
+            messagebox.showerror(
+                "AI Service Error",
+                f"Could not get AI recommendations: {str(e)}"
+            )
+        finally:
+            self.ai_button.config(state='normal', text="Get Fuel Tips")
+
+    def create_ai_prompt(self, fuel_type, mpg_text):
+        """Create prompt for AI recommendations"""
+        return f""" 
+Provide 4-5 practical fuel-saving tips for someone using {fuel_type} fuel. 
+Vehicle MPG: {mpg_text} 
+
+Please provide: 
+1. Driving habit improvements 
+2. Vehicle maintenance tips 
+3. Fuel purchasing strategies 
+4. General efficiency advice 
+
+Make the tips specific, actionable, and relevant to daily driving. 
+Format as a numbered list with each tip being 1-2 sentences. 
+Focus on practical advice that can be implemented immediately. 
+"""
+
+
+def main():
+    """Main function to run the application"""
+    try:
+        app = FuelTrack()
+        app.mainloop()
+    except Exception as e:
+        messagebox.showerror("Application Error", f"Failed to start application: {str(e)}")
+
+
+if __name__ == '__main__':
+    main()
