@@ -1,1 +1,1 @@
-# FuelTrack
+This code is apart of my groups Final project in my MIS course. We decided to use a problem that affects everyone, that being the struggle to find affordable gas in the area. This program uses Google Maps API in order to let users have a map view of their surrounding, selected area. It also uses different buttons and a list box to make it more easily accessible. After the user inputs their selections, it will provide the user with a cost breakdown using the input MPG and the specific station's gas price. 
